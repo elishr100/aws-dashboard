@@ -1,0 +1,1348 @@
+import { Router, Request, Response } from 'express';
+import { randomUUID } from 'crypto';
+import { ServiceFactory } from '../services/ServiceFactory.js';
+import { SecurityAuditAgent } from '../agents/SecurityAuditAgent.js';
+import { cacheService, CacheService } from '../services/CacheService.js';
+import { FindingSeverity, FindingStatus } from '../types/security.js';
+import type { AuditRequest, SecurityFinding } from '../types/security.js';
+import type { ResourceInventory } from '../types/index.js';
+
+const router = Router();
+
+// Store active audit jobs in memory
+interface AuditJob {
+  jobId: string;
+  status: 'pending' | 'running' | 'completed' | 'failed';
+  profile: string;
+  regions: string[];
+  startedAt: string;
+  completedAt?: string;
+  progress: {
+    phase: number;
+    totalPhases: number;
+    message: string;
+    current: number;
+    total: number;
+  };
+  findings: SecurityFinding[];
+  summary: {
+    total: number;
+    critical: number;
+    high: number;
+    medium: number;
+    low: number;
+    score?: number;
+  };
+  errors?: string[];
+}
+
+const auditJobs = new Map<string, AuditJob>();
+
+/**
+ * POST /api/security/audit
+ * Start a security audit with SSE streaming
+ */
+router.post('/audit', async (req: Request, res: Response) => {
+  try {
+    const auditRequest: AuditRequest = req.body;
+
+    console.log(`[SecurityAPI] Received audit request:`, JSON.stringify(auditRequest));
+
+    if (!auditRequest.profile || !auditRequest.regions || auditRequest.regions.length === 0) {
+      const errorMsg = 'profile and regions are required';
+      console.error(`[SecurityAPI] Validation error: ${errorMsg}`);
+      return res.status(400).json({
+        error: errorMsg,
+      });
+    }
+
+    // Generate job ID
+    const jobId = randomUUID();
+
+    // Create audit job
+    const job: AuditJob = {
+      jobId,
+      status: 'pending',
+      profile: auditRequest.profile,
+      regions: auditRequest.regions,
+      startedAt: new Date().toISOString(),
+      progress: {
+        phase: 0,
+        totalPhases: 3,
+        message: 'Initializing audit...',
+        current: 0,
+        total: 100,
+      },
+      findings: [],
+      summary: {
+        total: 0,
+        critical: 0,
+        high: 0,
+        medium: 0,
+        low: 0,
+      },
+    };
+
+    auditJobs.set(jobId, job);
+
+    console.log(`[SecurityAPI] Created audit job ${jobId} for ${auditRequest.profile} in regions: ${auditRequest.regions.join(', ')}`);
+
+    // Start audit in background (don't await)
+    executeAudit(jobId, auditRequest).catch(error => {
+      console.error(`[SecurityAPI] Error in background audit ${jobId}:`, error);
+      const job = auditJobs.get(jobId);
+      if (job) {
+        job.status = 'failed';
+        job.errors = [error instanceof Error ? error.message : 'Unknown error'];
+        job.completedAt = new Date().toISOString();
+      }
+    });
+
+    res.json({
+      success: true,
+      jobId,
+      message: 'Audit job started',
+      streamUrl: `/api/security/audit/${jobId}/stream`,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error: any) {
+    console.error('[SecurityAPI] ========== AUDIT FAILED ==========');
+    console.error('[SecurityAPI] Error name:', error.name);
+    console.error('[SecurityAPI] Error message:', error.message);
+    console.error('[SecurityAPI] Error stack:', error.stack);
+    console.error('[SecurityAPI] Error details:', JSON.stringify(error, null, 2));
+    console.error('[SecurityAPI] ====================================');
+    res.status(500).json({
+      error: 'Failed to start security audit',
+      message: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined,
+    });
+  }
+});
+
+/**
+ * GET /api/security/audit/:jobId/stream
+ * Server-Sent Events stream for audit progress
+ */
+router.get('/audit/:jobId/stream', (req: Request, res: Response) => {
+  const { jobId } = req.params;
+
+  console.log(`[SecurityAPI] GET /audit/${jobId}/stream - SSE connection opened`);
+
+  const job = auditJobs.get(jobId);
+
+  if (!job) {
+    return res.status(404).json({
+      success: false,
+      error: 'Audit job not found',
+    });
+  }
+
+  // Set timeout to 600 seconds (10 minutes) for SSE connection
+  req.setTimeout(600000);
+  res.setTimeout(600000);
+
+  // Set up SSE
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  // Send initial job status
+  const startMessage = {
+    type: 'progress',
+    data: {
+      progress: job.progress,
+      message: job.progress.message,
+      jobId: job.jobId,
+      findingsCount: job.findings.length,
+    }
+  };
+  sendSSE(res, 'message', startMessage);
+
+  // Poll for updates every 500ms
+  const interval = setInterval(() => {
+    const currentJob = auditJobs.get(jobId);
+
+    if (!currentJob) {
+      const errorMessage = {
+        type: 'error',
+        data: { error: 'Job not found' }
+      };
+      sendSSE(res, 'message', errorMessage);
+      clearInterval(interval);
+      res.end();
+      return;
+    }
+
+    // Send progress update
+    const progressMessage = {
+      type: 'progress',
+      data: {
+        progress: currentJob.progress,
+        message: currentJob.progress.message,
+        jobId: currentJob.jobId,
+        findingsCount: currentJob.findings.length,
+      }
+    };
+    sendSSE(res, 'message', progressMessage);
+
+    // Stream new findings (send only the last finding if changed)
+    if (currentJob.findings.length > 0) {
+      const lastFinding = currentJob.findings[currentJob.findings.length - 1];
+      const findingMessage = {
+        type: 'finding',
+        data: {
+          finding: lastFinding,
+          totalFindings: currentJob.findings.length,
+          jobId: currentJob.jobId,
+        }
+      };
+      // Only send if we haven't sent this finding before (simplified - just send on each poll)
+      // In production, you'd track which findings have been sent
+    }
+
+    // If job is complete or failed, end stream
+    if (currentJob.status === 'completed' || currentJob.status === 'failed') {
+      const completeMessage = {
+        type: currentJob.status === 'failed' ? 'error' : 'complete',
+        data: {
+          progress: currentJob.progress,
+          message: currentJob.status === 'failed'
+            ? `Audit failed: ${currentJob.errors?.join(', ')}`
+            : `Audit completed - ${currentJob.findings.length} findings discovered`,
+          summary: currentJob.summary,
+          findings: currentJob.findings,
+          error: currentJob.status === 'failed' ? (currentJob.errors?.join(', ') || 'Unknown error') : undefined,
+          jobId: currentJob.jobId,
+        }
+      };
+      sendSSE(res, 'message', completeMessage);
+      clearInterval(interval);
+      res.end();
+      console.log(`[SecurityAPI] SSE stream closed for audit job ${jobId}`);
+    }
+  }, 500);
+
+  // Clean up on client disconnect
+  req.on('close', () => {
+    clearInterval(interval);
+    console.log(`[SecurityAPI] Client disconnected from SSE stream ${jobId}`);
+  });
+});
+
+/**
+ * GET /api/security/audit/:jobId/status
+ * Get audit job status
+ */
+router.get('/audit/:jobId/status', (req: Request, res: Response) => {
+  try {
+    const { jobId } = req.params;
+
+    console.log(`[SecurityAPI] GET /audit/${jobId}/status`);
+
+    const job = auditJobs.get(jobId);
+
+    if (!job) {
+      return res.status(404).json({
+        success: false,
+        error: 'Audit job not found',
+      });
+    }
+
+    res.json({
+      success: true,
+      status: job.status,
+      progress: job.progress,
+      findingsCount: job.findings.length,
+      summary: job.summary,
+      completedAt: job.completedAt,
+      errors: job.errors,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error: any) {
+    console.error('[SecurityAPI] Error in GET /audit/:jobId/status:', error);
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : 'Unknown error',
+    });
+  }
+});
+
+/**
+ * POST /api/security/scan
+ * Manually trigger security scan using cached resources
+ */
+router.post('/scan', async (req: Request, res: Response) => {
+  try {
+    const { profile, regions } = req.body;
+
+    if (!profile || !regions || regions.length === 0) {
+      return res.status(400).json({
+        error: 'profile and regions are required',
+      });
+    }
+
+    console.log(`[SecurityAPI] Starting manual security scan for ${profile}`);
+
+    const auditAgent = new SecurityAuditAgent();
+    const allFindings: SecurityFinding[] = [];
+
+    // Audit resources in each region using cached data
+    for (const region of regions) {
+      const cacheKey = CacheService.resourceKey(profile, region);
+      const inventory = cacheService.get<ResourceInventory>(cacheKey);
+
+      if (!inventory || !inventory.resources || inventory.resources.length === 0) {
+        console.log(`[SecurityAPI] No cached resources found for ${region}, skipping`);
+        continue;
+      }
+
+      console.log(`[SecurityAPI] Auditing ${inventory.resources.length} resources in ${region}`);
+
+      const findings = await auditAgent.auditResources(inventory, profile, region);
+      allFindings.push(...findings);
+
+      // Cache the findings for this region
+      const securityCacheKey = `security:${profile}:${region}`;
+      cacheService.set(securityCacheKey, findings, CacheService.TTL.SECURITY_ALERTS);
+      console.log(`[SecurityAPI] Cached ${findings.length} findings for ${region}`);
+    }
+
+    // Create alerts from critical and high severity findings using singleton AlertService
+    const criticalFindings = allFindings.filter(
+      (f) => f.severity === 'CRITICAL' || f.severity === 'HIGH'
+    );
+
+    if (criticalFindings.length > 0) {
+      const alertService = ServiceFactory.getAlertService();
+      alertService.createAlertsFromFindings(criticalFindings);
+      console.log(`[SecurityAPI] Created ${criticalFindings.length} security alerts`);
+
+      // Cache alerts
+      for (const region of regions) {
+        const regionAlerts = criticalFindings.filter((f) => f.region === region);
+        if (regionAlerts.length > 0) {
+          const alertCacheKey = CacheService.alertKey(profile, region);
+          const alerts = alertService.getAlerts({ profile, region });
+          cacheService.set(alertCacheKey, alerts, CacheService.TTL.SECURITY_ALERTS);
+        }
+      }
+    }
+
+    const summary = {
+      total: allFindings.length,
+      critical: allFindings.filter((f) => f.severity === 'CRITICAL').length,
+      high: allFindings.filter((f) => f.severity === 'HIGH').length,
+      medium: allFindings.filter((f) => f.severity === 'MEDIUM').length,
+      low: allFindings.filter((f) => f.severity === 'LOW').length,
+    };
+
+    res.json({
+      success: true,
+      findings: allFindings,
+      summary,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error: any) {
+    console.error('[SecurityAPI] Security scan failed:', error);
+    res.status(500).json({
+      error: 'Failed to perform security scan',
+      message: error.message,
+    });
+  }
+});
+
+/**
+ * GET /api/security/findings
+ * Get security findings with filters (reads from cache)
+ */
+router.get('/findings', (req: Request, res: Response) => {
+  try {
+    const { profile, region, severity, status } = req.query;
+
+    let allFindings: SecurityFinding[] = [];
+
+    if (profile && region) {
+      // Get findings for specific profile and region from cache
+      const cacheKey = `security:${profile}:${region}`;
+      const cachedFindings = cacheService.get<SecurityFinding[]>(cacheKey);
+
+      if (cachedFindings) {
+        allFindings = cachedFindings;
+        console.log(`[SecurityAPI] Retrieved ${allFindings.length} findings from cache for ${profile}/${region}`);
+      }
+    } else if (profile) {
+      // Get findings for all regions of a profile
+      const cacheKeys = cacheService.getKeys().filter(key => key.startsWith(`security:${profile}:`));
+      for (const key of cacheKeys) {
+        const findings = cacheService.get<SecurityFinding[]>(key);
+        if (findings) {
+          allFindings.push(...findings);
+        }
+      }
+      console.log(`[SecurityAPI] Retrieved ${allFindings.length} findings from cache for profile ${profile}`);
+    }
+
+    // Apply filters
+    let filtered = allFindings;
+
+    if (severity) {
+      filtered = filtered.filter((f) => f.severity === severity);
+    }
+    if (status) {
+      filtered = filtered.filter((f) => f.status === status);
+    }
+
+    res.json(filtered);
+  } catch (error: any) {
+    console.error('[SecurityAPI] Failed to get findings:', error);
+    res.status(500).json({
+      error: 'Failed to retrieve findings',
+      message: error.message,
+    });
+  }
+});
+
+/**
+ * PATCH /api/security/findings/:findingId
+ * Update finding status
+ */
+router.patch('/findings/:findingId', (req: Request, res: Response) => {
+  try {
+    const { findingId } = req.params;
+    const { status, profile, region } = req.body;
+
+    if (!status || !profile || !region) {
+      return res.status(400).json({ error: 'status, profile, and region are required' });
+    }
+
+    // Get SecurityAuditService from ServiceFactory (shared singleton)
+    const auditService = ServiceFactory.getSecurityAuditService(profile as string, region as string);
+    const updated = auditService.updateFinding(findingId, status as FindingStatus);
+
+    if (!updated) {
+      return res.status(404).json({ error: 'Finding not found' });
+    }
+
+    res.json({ success: true, findingId, status });
+  } catch (error: any) {
+    console.error('[SecurityAPI] Failed to update finding:', error);
+    res.status(500).json({
+      error: 'Failed to update finding',
+      message: error.message,
+    });
+  }
+});
+
+/**
+ * GET /api/security/compliance
+ * Get compliance report
+ */
+router.get('/compliance', (req: Request, res: Response) => {
+  try {
+    const { profile, region } = req.query;
+
+    if (!profile || !region) {
+      return res.status(400).json({
+        error: 'profile and region are required',
+      });
+    }
+
+    // Get SecurityAuditService from ServiceFactory (shared singleton)
+    const auditService = ServiceFactory.getSecurityAuditService(profile as string, region as string);
+    const report = auditService.getComplianceReport(profile as string, region as string);
+
+    res.json(report);
+  } catch (error: any) {
+    console.error('[SecurityAPI] Failed to get compliance report:', error);
+    res.status(500).json({
+      error: 'Failed to retrieve compliance report',
+      message: error.message,
+    });
+  }
+});
+
+/**
+ * GET /api/security/alerts
+ * Get security alerts
+ */
+router.get('/alerts', (req: Request, res: Response) => {
+  try {
+    const { profile, region, severity, acknowledged } = req.query;
+
+    const alertService = ServiceFactory.getAlertService();
+    const alerts = alertService.getAlerts({
+      profile: profile as string,
+      region: region as string,
+      severity: severity as FindingSeverity,
+      acknowledged: acknowledged === 'true' ? true : acknowledged === 'false' ? false : undefined,
+    });
+
+    res.json(alerts);
+  } catch (error: any) {
+    console.error('[SecurityAPI] Failed to get alerts:', error);
+    res.status(500).json({
+      error: 'Failed to retrieve alerts',
+      message: error.message,
+    });
+  }
+});
+
+/**
+ * GET /api/security/alerts/:alertId
+ * Get specific alert
+ */
+router.get('/alerts/:alertId', (req: Request, res: Response) => {
+  try {
+    const { alertId } = req.params;
+    const alertService = ServiceFactory.getAlertService();
+    const alert = alertService.getAlert(alertId);
+
+    if (!alert) {
+      return res.status(404).json({ error: 'Alert not found' });
+    }
+
+    res.json(alert);
+  } catch (error: any) {
+    console.error('[SecurityAPI] Failed to get alert:', error);
+    res.status(500).json({
+      error: 'Failed to retrieve alert',
+      message: error.message,
+    });
+  }
+});
+
+/**
+ * POST /api/security/alerts/:alertId/acknowledge
+ * Acknowledge an alert
+ */
+router.post('/alerts/:alertId/acknowledge', (req: Request, res: Response) => {
+  try {
+    const { alertId } = req.params;
+    const { acknowledgedBy } = req.body;
+
+    const alertService = ServiceFactory.getAlertService();
+    const success = alertService.acknowledgeAlert(alertId, acknowledgedBy);
+
+    if (!success) {
+      return res.status(404).json({ error: 'Alert not found' });
+    }
+
+    res.json({ success: true, alertId });
+  } catch (error: any) {
+    console.error('[SecurityAPI] Failed to acknowledge alert:', error);
+    res.status(500).json({
+      error: 'Failed to acknowledge alert',
+      message: error.message,
+    });
+  }
+});
+
+/**
+ * POST /api/security/alerts/acknowledge-multiple
+ * Acknowledge multiple alerts
+ */
+router.post('/alerts/acknowledge-multiple', (req: Request, res: Response) => {
+  try {
+    const { alertIds, acknowledgedBy } = req.body;
+
+    if (!alertIds || !Array.isArray(alertIds)) {
+      return res.status(400).json({ error: 'alertIds array is required' });
+    }
+
+    const alertService = ServiceFactory.getAlertService();
+    const acknowledged = alertService.acknowledgeAlerts(alertIds, acknowledgedBy);
+
+    res.json({ success: true, acknowledged, total: alertIds.length });
+  } catch (error: any) {
+    console.error('[SecurityAPI] Failed to acknowledge alerts:', error);
+    res.status(500).json({
+      error: 'Failed to acknowledge alerts',
+      message: error.message,
+    });
+  }
+});
+
+/**
+ * GET /api/security/alerts/stats
+ * Get alert statistics
+ */
+router.get('/alerts/stats', (req: Request, res: Response) => {
+  try {
+    const alertService = ServiceFactory.getAlertService();
+    const stats = alertService.getAlertStats();
+    res.json(stats);
+  } catch (error: any) {
+    console.error('[SecurityAPI] Failed to get alert stats:', error);
+    res.status(500).json({
+      error: 'Failed to retrieve alert statistics',
+      message: error.message,
+    });
+  }
+});
+
+/**
+ * DELETE /api/security/alerts/:alertId
+ * Delete an alert
+ */
+router.delete('/alerts/:alertId', (req: Request, res: Response) => {
+  try {
+    const { alertId } = req.params;
+    const alertService = ServiceFactory.getAlertService();
+    const deleted = alertService.deleteAlert(alertId);
+
+    if (!deleted) {
+      return res.status(404).json({ error: 'Alert not found' });
+    }
+
+    res.json({ success: true, alertId });
+  } catch (error: any) {
+    console.error('[SecurityAPI] Failed to delete alert:', error);
+    res.status(500).json({
+      error: 'Failed to delete alert',
+      message: error.message,
+    });
+  }
+});
+
+/**
+ * GET /api/security/alerts/stream
+ * SSE stream for real-time alerts
+ */
+router.get('/alerts/stream', (req: Request, res: Response) => {
+  // Set timeout to 300 seconds (5 minutes) for SSE connection
+  req.setTimeout(300000);
+  res.setTimeout(300000);
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+
+  console.log('[SecurityAPI] Client connected to alert stream');
+
+  // Send initial connection message
+  res.write('data: {"type":"connected","message":"Alert stream connected"}\n\n');
+
+  const alertService = ServiceFactory.getAlertService();
+
+  // Listen for new alerts
+  const onAlert = (alert: any) => {
+    res.write(`data: ${JSON.stringify({ type: 'alert', data: alert })}\n\n`);
+  };
+
+  const onAcknowledged = (alert: any) => {
+    res.write(`data: ${JSON.stringify({ type: 'acknowledged', data: alert })}\n\n`);
+  };
+
+  alertService.on('alert', onAlert);
+  alertService.on('alert-acknowledged', onAcknowledged);
+
+  // Clean up on client disconnect
+  req.on('close', () => {
+    console.log('[SecurityAPI] Client disconnected from alert stream');
+    alertService.off('alert', onAlert);
+    alertService.off('alert-acknowledged', onAcknowledged);
+  });
+});
+
+/**
+ * Execute audit in background with streaming updates
+ */
+async function executeAudit(jobId: string, request: AuditRequest): Promise<void> {
+  const job = auditJobs.get(jobId);
+  if (!job) return;
+
+  console.log(`[SecurityAPI] Starting audit ${jobId} for ${request.profile} in ${request.regions.length} regions`);
+
+  job.status = 'running';
+
+  try {
+    // PHASE 1: Quick checks (S3, EC2, VPC) - < 30 seconds
+    job.progress = {
+      phase: 1,
+      totalPhases: 3,
+      message: 'Phase 1/3: Running quick security checks...',
+      current: 0,
+      total: 100,
+    };
+
+    await executePhase1QuickChecks(job, request);
+
+    // PHASE 2: IAM analysis - 1-3 minutes
+    job.progress = {
+      phase: 2,
+      totalPhases: 3,
+      message: 'Phase 2/3: Analyzing IAM roles and policies...',
+      current: 0,
+      total: 100,
+    };
+
+    await executePhase2IAMAnalysis(job, request);
+
+    // PHASE 3: Resource policies - 1-2 minutes
+    job.progress = {
+      phase: 3,
+      totalPhases: 3,
+      message: 'Phase 3/3: Checking resource policies...',
+      current: 0,
+      total: 100,
+    };
+
+    await executePhase3ResourcePolicies(job, request);
+
+    // Calculate security score
+    const totalFindings = job.findings.length;
+    const criticalCount = job.summary.critical;
+    const highCount = job.summary.high;
+
+    // Score: 100 - (critical * 20 + high * 10 + medium * 5 + low * 2)
+    const deductions = (criticalCount * 20) + (highCount * 10) + (job.summary.medium * 5) + (job.summary.low * 2);
+    job.summary.score = Math.max(0, 100 - deductions);
+
+    // Store findings in cache for persistence
+    for (const region of request.regions) {
+      const regionFindings = job.findings.filter((f) => f.region === region);
+      if (regionFindings.length > 0) {
+        const securityCacheKey = `security:${request.profile}:${region}`;
+        cacheService.set(securityCacheKey, regionFindings, CacheService.TTL.SECURITY_ALERTS);
+        console.log(`[SecurityAPI] Cached ${regionFindings.length} findings for ${region}`);
+      }
+    }
+
+    // Create alerts from critical and high severity findings
+    const criticalFindings = job.findings.filter(
+      (f) => f.severity === 'CRITICAL' || f.severity === 'HIGH'
+    );
+    if (criticalFindings.length > 0) {
+      const alertService = ServiceFactory.getAlertService();
+      alertService.createAlertsFromFindings(criticalFindings);
+      console.log(`[SecurityAPI] Created ${criticalFindings.length} security alerts`);
+    }
+
+    job.status = 'completed';
+    job.completedAt = new Date().toISOString();
+    job.progress = {
+      phase: 3,
+      totalPhases: 3,
+      message: `Audit completed - ${totalFindings} findings discovered`,
+      current: 100,
+      total: 100,
+    };
+
+    console.log(`[SecurityAPI] Audit ${jobId} completed - found ${totalFindings} findings`);
+
+    // Clean up job after 5 minutes
+    setTimeout(() => {
+      auditJobs.delete(jobId);
+      console.log(`[SecurityAPI] Cleaned up audit job ${jobId}`);
+    }, 5 * 60 * 1000);
+  } catch (error: any) {
+    console.error(`[SecurityAPI] Audit ${jobId} failed:`, error);
+    job.status = 'failed';
+    job.errors = job.errors || [];
+    job.errors.push(error instanceof Error ? error.message : 'Unknown error');
+    job.completedAt = new Date().toISOString();
+  }
+}
+
+/**
+ * Phase 1: Quick security checks (S3, EC2, VPC)
+ */
+async function executePhase1QuickChecks(job: AuditJob, request: AuditRequest): Promise<void> {
+  console.log(`[SecurityAPI] Phase 1: Quick checks for ${request.profile}`);
+
+  const auditAgent = new SecurityAuditAgent();
+
+  for (const region of request.regions) {
+    try {
+      // Get cached resources
+      const cacheKey = CacheService.resourceKey(request.profile, region);
+      const inventory = cacheService.get<ResourceInventory>(cacheKey);
+
+      if (!inventory || !inventory.resources || inventory.resources.length === 0) {
+        console.log(`[SecurityAPI] No cached resources found for ${region}, skipping`);
+        continue;
+      }
+
+      console.log(`[SecurityAPI] Phase 1: Auditing ${inventory.resources.length} resources in ${region}`);
+
+      // Run quick checks on S3, EC2, VPC resources
+      const findings = await auditAgent.auditResources(inventory, request.profile, region);
+
+      // Add findings to job
+      job.findings.push(...findings);
+
+      // Update summary
+      updateJobSummary(job);
+
+      console.log(`[SecurityAPI] Phase 1: Found ${findings.length} findings in ${region}`);
+    } catch (error: any) {
+      console.error(`[SecurityAPI] Phase 1 error in ${region}:`, error);
+      job.errors = job.errors || [];
+      job.errors.push(`Phase 1 ${region}: ${error.message}`);
+    }
+  }
+
+  job.progress.current = 33;
+  job.progress.message = `Phase 1 complete - ${job.findings.length} findings so far`;
+}
+
+/**
+ * Phase 2: IAM analysis (batched)
+ */
+async function executePhase2IAMAnalysis(job: AuditJob, request: AuditRequest): Promise<void> {
+  console.log(`[SecurityAPI] Phase 2: IAM analysis for ${request.profile}`);
+
+  try {
+    // Get IAM resources from global cache
+    const globalCacheKey = `resources:${request.profile}:global`;
+    const globalInventory = cacheService.get<ResourceInventory>(globalCacheKey);
+
+    if (!globalInventory || !globalInventory.resources) {
+      console.log(`[SecurityAPI] No global IAM resources found, skipping Phase 2`);
+      job.progress.current = 66;
+      return;
+    }
+
+    const iamRoles = globalInventory.resources.filter(r => r.type === 'IAMRole');
+    const iamUsers = globalInventory.resources.filter(r => r.type === 'IAMUser');
+    const iamPolicies = globalInventory.resources.filter(r => r.type === 'IAMPolicy');
+
+    console.log(`[SecurityAPI] Phase 2: Analyzing ${iamRoles.length} roles, ${iamUsers.length} users, ${iamPolicies.length} policies`);
+
+    // Process IAM roles in batches of 5
+    const BATCH_SIZE = 5;
+    const totalItems = iamRoles.length + iamUsers.length + iamPolicies.length;
+    let processedItems = 0;
+
+    // Analyze IAM roles
+    for (let i = 0; i < iamRoles.length; i += BATCH_SIZE) {
+      const batch = iamRoles.slice(i, i + BATCH_SIZE);
+
+      for (const role of batch) {
+        try {
+          const roleDetails = (role as any).details;
+
+          if (roleDetails && roleDetails.assumeRolePolicyDocument) {
+            const policyDoc = typeof roleDetails.assumeRolePolicyDocument === 'string'
+              ? JSON.parse(roleDetails.assumeRolePolicyDocument)
+              : roleDetails.assumeRolePolicyDocument;
+
+            // Check 1: Wildcard principals
+            if (policyDoc.Statement?.some((s: any) => s.Principal === '*' || s.Principal?.AWS === '*')) {
+              job.findings.push({
+                id: `finding-${Date.now()}-${role.id}-wildcard-principal`,
+                checkType: 'IAM_OVERPRIVILEGED_POLICY' as any,
+                severity: FindingSeverity.CRITICAL,
+                status: FindingStatus.ACTIVE,
+                resourceId: role.id,
+                resourceType: 'IAMRole',
+                resourceName: role.name,
+                region: 'global',
+                profile: request.profile,
+                title: 'IAM Role with Wildcard Principal',
+                description: `IAM role "${role.name}" has a wildcard (*) principal in its assume role policy, allowing any AWS account to assume this role.`,
+                recommendation: 'Restrict the assume role policy to specific AWS accounts or services using least privilege principle.',
+                detectedAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+              });
+            }
+          }
+
+          // Check 2: Check attached managed policies for wildcards
+          if (roleDetails && roleDetails.attachedManagedPolicies) {
+            const adminPolicies = roleDetails.attachedManagedPolicies.filter((p: any) =>
+              p.PolicyName?.includes('Administrator') ||
+              p.PolicyArn?.includes('AdministratorAccess')
+            );
+
+            if (adminPolicies.length > 0) {
+              job.findings.push({
+                id: `finding-${Date.now()}-${role.id}-admin-policy`,
+                checkType: 'IAM_OVERPRIVILEGED_POLICY' as any,
+                severity: FindingSeverity.HIGH,
+                status: FindingStatus.ACTIVE,
+                resourceId: role.id,
+                resourceType: 'IAMRole',
+                resourceName: role.name,
+                region: 'global',
+                profile: request.profile,
+                title: 'IAM Role with Administrator Access',
+                description: `IAM role "${role.name}" has AdministratorAccess policy attached, granting full permissions across all AWS services.`,
+                recommendation: 'Follow the principle of least privilege. Replace AdministratorAccess with specific permissions needed for the role.',
+                detectedAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+              });
+            }
+          }
+
+          processedItems++;
+          job.progress.current = 33 + Math.floor((processedItems / totalItems) * 33);
+          job.progress.message = `Phase 2/3: Analyzing IAM role ${processedItems} of ${totalItems}... (${job.findings.length} findings)`;
+
+          await new Promise(resolve => setTimeout(resolve, 10));
+        } catch (error: any) {
+          console.error(`[SecurityAPI] Error analyzing IAM role ${role.id}:`, error);
+        }
+      }
+    }
+
+    // Analyze IAM users
+    for (const user of iamUsers) {
+      try {
+        const userDetails = (user as any).details;
+
+        // Check for users without MFA
+        if (userDetails && userDetails.mfaEnabled === false) {
+          job.findings.push({
+            id: `finding-${Date.now()}-${user.id}-no-mfa`,
+            checkType: 'IAM_USER_WITHOUT_MFA' as any,
+            severity: FindingSeverity.HIGH,
+            status: FindingStatus.ACTIVE,
+            resourceId: user.id,
+            resourceType: 'IAMUser',
+            resourceName: user.name,
+            region: 'global',
+            profile: request.profile,
+            title: 'IAM User Without MFA',
+            description: `IAM user "${user.name}" does not have MFA enabled, increasing the risk of account compromise.`,
+            recommendation: 'Enable MFA for all IAM users, especially those with console access.',
+            detectedAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          });
+        }
+
+        processedItems++;
+        job.progress.current = 33 + Math.floor((processedItems / totalItems) * 33);
+        job.progress.message = `Phase 2/3: Analyzing IAM user ${processedItems} of ${totalItems}... (${job.findings.length} findings)`;
+
+        await new Promise(resolve => setTimeout(resolve, 10));
+      } catch (error: any) {
+        console.error(`[SecurityAPI] Error analyzing IAM user ${user.id}:`, error);
+      }
+    }
+
+    // Analyze IAM policies
+    for (const policy of iamPolicies) {
+      try {
+        const policyDetails = (policy as any).details;
+
+        if (policyDetails && policyDetails.policyDocument) {
+          const policyDoc = typeof policyDetails.policyDocument === 'string'
+            ? JSON.parse(policyDetails.policyDocument)
+            : policyDetails.policyDocument;
+
+          // Check for wildcard actions
+          const hasWildcardActions = policyDoc.Statement?.some((s: any) =>
+            s.Effect === 'Allow' && (s.Action === '*' || (Array.isArray(s.Action) && s.Action.includes('*')))
+          );
+
+          if (hasWildcardActions) {
+            job.findings.push({
+              id: `finding-${Date.now()}-${policy.id}-wildcard-action`,
+              checkType: 'IAM_POLICY_WILDCARD' as any,
+              severity: FindingSeverity.MEDIUM,
+              status: FindingStatus.ACTIVE,
+              resourceId: policy.id,
+              resourceType: 'IAMPolicy',
+              resourceName: policy.name,
+              region: 'global',
+              profile: request.profile,
+              title: 'IAM Policy with Wildcard Actions',
+              description: `IAM policy "${policy.name}" contains wildcard (*) actions, granting overly broad permissions.`,
+              recommendation: 'Replace wildcard actions with specific actions required for the use case.',
+              detectedAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            });
+          }
+        }
+
+        processedItems++;
+        job.progress.current = 33 + Math.floor((processedItems / totalItems) * 33);
+        await new Promise(resolve => setTimeout(resolve, 10));
+      } catch (error: any) {
+        console.error(`[SecurityAPI] Error analyzing IAM policy ${policy.id}:`, error);
+      }
+    }
+
+    updateJobSummary(job);
+    console.log(`[SecurityAPI] Phase 2 complete - ${job.findings.length} total findings`);
+  } catch (error: any) {
+    console.error(`[SecurityAPI] Phase 2 error:`, error);
+    job.errors = job.errors || [];
+    job.errors.push(`Phase 2: ${error.message}`);
+  }
+
+  job.progress.current = 66;
+  job.progress.message = `Phase 2 complete - ${job.findings.length} findings so far`;
+}
+
+/**
+ * Phase 3: Resource policies (S3, SQS, SNS, KMS, Lambda, ECR)
+ */
+async function executePhase3ResourcePolicies(job: AuditJob, request: AuditRequest): Promise<void> {
+  console.log(`[SecurityAPI] Phase 3: Resource policies for ${request.profile}`);
+
+  for (const region of request.regions) {
+    try {
+      const cacheKey = CacheService.resourceKey(request.profile, region);
+      const inventory = cacheService.get<ResourceInventory>(cacheKey);
+
+      if (!inventory || !inventory.resources) {
+        continue;
+      }
+
+      let totalResources = 0;
+      let processedResources = 0;
+
+      // Count resources to check
+      const s3Buckets = inventory.resources.filter(r => r.type === 'S3');
+      const sqsQueues = inventory.resources.filter(r => r.type === 'SQS');
+      const snsTopics = inventory.resources.filter(r => r.type === 'SNS');
+      const kmsKeys = inventory.resources.filter(r => r.type === 'KMS');
+      const lambdas = inventory.resources.filter(r => r.type === 'Lambda');
+      const ecrRepos = inventory.resources.filter(r => r.type === 'ECR');
+
+      totalResources = s3Buckets.length + sqsQueues.length + snsTopics.length +
+                      kmsKeys.length + lambdas.length + ecrRepos.length;
+
+      console.log(`[SecurityAPI] Phase 3: Checking ${totalResources} resources in ${region}`);
+
+      // Check S3 bucket policies
+      for (const bucket of s3Buckets) {
+        try {
+          const bucketDetails = (bucket as any).details;
+
+          // Check bucket policy
+          if (bucketDetails && bucketDetails.policy) {
+            const policy = typeof bucketDetails.policy === 'string'
+              ? JSON.parse(bucketDetails.policy)
+              : bucketDetails.policy;
+
+            // Check for public access via policy
+            const hasPublicAccess = policy.Statement?.some((s: any) =>
+              s.Effect === 'Allow' &&
+              (s.Principal === '*' || s.Principal?.AWS === '*')
+            );
+
+            if (hasPublicAccess) {
+              job.findings.push({
+                id: `finding-${Date.now()}-${bucket.id}-public-policy`,
+                checkType: 'S3_BUCKET_PUBLIC_ACCESS' as any,
+                severity: FindingSeverity.CRITICAL,
+                status: FindingStatus.ACTIVE,
+                resourceId: bucket.id,
+                resourceType: 'S3',
+                resourceName: bucket.name,
+                region,
+                profile: request.profile,
+                title: 'S3 Bucket with Public Access Policy',
+                description: `S3 bucket "${bucket.name}" has a bucket policy that allows public access (Principal: *).`,
+                recommendation: 'Remove public access from the bucket policy. Use CloudFront or signed URLs for public content delivery.',
+                detectedAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+              });
+            }
+          }
+
+          // Check for public ACL
+          if (bucketDetails && bucketDetails.publicAccessBlock === false) {
+            job.findings.push({
+              id: `finding-${Date.now()}-${bucket.id}-public-acl`,
+              checkType: 'S3_BUCKET_PUBLIC_ACCESS' as any,
+              severity: FindingSeverity.HIGH,
+              status: FindingStatus.ACTIVE,
+              resourceId: bucket.id,
+              resourceType: 'S3',
+              resourceName: bucket.name,
+              region,
+              profile: request.profile,
+              title: 'S3 Bucket Without Public Access Block',
+              description: `S3 bucket "${bucket.name}" does not have Block Public Access enabled, allowing potential public exposure.`,
+              recommendation: 'Enable Block Public Access settings for the bucket unless public access is explicitly required.',
+              detectedAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            });
+          }
+
+          processedResources++;
+          await new Promise(resolve => setTimeout(resolve, 10));
+        } catch (error: any) {
+          console.error(`[SecurityAPI] Error checking S3 bucket ${bucket.id}:`, error);
+        }
+      }
+
+      // Check SQS queue policies
+      for (const queue of sqsQueues) {
+        try {
+          const queueDetails = (queue as any).details;
+
+          if (queueDetails && queueDetails.policy) {
+            const policy = typeof queueDetails.policy === 'string'
+              ? JSON.parse(queueDetails.policy)
+              : queueDetails.policy;
+
+            // Check for public access
+            const hasPublicAccess = policy.Statement?.some((s: any) =>
+              s.Effect === 'Allow' && (s.Principal === '*' || s.Principal?.AWS === '*')
+            );
+
+            if (hasPublicAccess) {
+              job.findings.push({
+                id: `finding-${Date.now()}-${queue.id}-public-policy`,
+                checkType: 'IAM_OVERPRIVILEGED_POLICY' as any,
+                severity: FindingSeverity.HIGH,
+                status: FindingStatus.ACTIVE,
+                resourceId: queue.id,
+                resourceType: 'SQS',
+                resourceName: queue.name,
+                region,
+                profile: request.profile,
+                title: 'SQS Queue with Public Access',
+                description: `SQS queue "${queue.name}" has a policy that allows public access (Principal: *).`,
+                recommendation: 'Restrict queue access to specific AWS principals or services.',
+                detectedAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+              });
+            }
+          }
+
+          processedResources++;
+          await new Promise(resolve => setTimeout(resolve, 10));
+        } catch (error: any) {
+          console.error(`[SecurityAPI] Error checking SQS queue ${queue.id}:`, error);
+        }
+      }
+
+      // Check SNS topic policies
+      for (const topic of snsTopics) {
+        try {
+          const topicDetails = (topic as any).details;
+
+          if (topicDetails && topicDetails.policy) {
+            const policy = typeof topicDetails.policy === 'string'
+              ? JSON.parse(topicDetails.policy)
+              : topicDetails.policy;
+
+            // Check for public publish access
+            const hasPublicPublish = policy.Statement?.some((s: any) =>
+              s.Effect === 'Allow' &&
+              (s.Principal === '*' || s.Principal?.AWS === '*') &&
+              (s.Action === 'SNS:Publish' || s.Action?.includes('SNS:Publish'))
+            );
+
+            if (hasPublicPublish) {
+              job.findings.push({
+                id: `finding-${Date.now()}-${topic.id}-public-publish`,
+                checkType: 'IAM_OVERPRIVILEGED_POLICY' as any,
+                severity: FindingSeverity.HIGH,
+                status: FindingStatus.ACTIVE,
+                resourceId: topic.id,
+                resourceType: 'SNS',
+                resourceName: topic.name,
+                region,
+                profile: request.profile,
+                title: 'SNS Topic with Public Publish Access',
+                description: `SNS topic "${topic.name}" allows public publish access, potentially enabling spam or abuse.`,
+                recommendation: 'Restrict publish permissions to specific AWS principals or services.',
+                detectedAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+              });
+            }
+          }
+
+          processedResources++;
+          await new Promise(resolve => setTimeout(resolve, 10));
+        } catch (error: any) {
+          console.error(`[SecurityAPI] Error checking SNS topic ${topic.id}:`, error);
+        }
+      }
+
+      // Check KMS key policies
+      for (const key of kmsKeys) {
+        try {
+          const keyDetails = (key as any).details;
+
+          if (keyDetails && keyDetails.keyPolicy) {
+            const policy = typeof keyDetails.keyPolicy === 'string'
+              ? JSON.parse(keyDetails.keyPolicy)
+              : keyDetails.keyPolicy;
+
+            // Check for public access
+            const hasPublicAccess = policy.Statement?.some((s: any) =>
+              s.Effect === 'Allow' && (s.Principal === '*' || s.Principal?.AWS === '*')
+            );
+
+            if (hasPublicAccess) {
+              job.findings.push({
+                id: `finding-${Date.now()}-${key.id}-public-policy`,
+                checkType: 'IAM_OVERPRIVILEGED_POLICY' as any,
+                severity: FindingSeverity.CRITICAL,
+                status: FindingStatus.ACTIVE,
+                resourceId: key.id,
+                resourceType: 'KMS',
+                resourceName: key.name,
+                region,
+                profile: request.profile,
+                title: 'KMS Key with Public Access',
+                description: `KMS key "${key.name}" has a key policy that allows public access, potentially exposing encrypted data.`,
+                recommendation: 'Restrict key usage to specific AWS principals. Remove wildcard principals.',
+                detectedAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+              });
+            }
+          }
+
+          processedResources++;
+          await new Promise(resolve => setTimeout(resolve, 10));
+        } catch (error: any) {
+          console.error(`[SecurityAPI] Error checking KMS key ${key.id}:`, error);
+        }
+      }
+
+      // Check Lambda function policies and URLs
+      for (const lambda of lambdas) {
+        try {
+          const lambdaDetails = (lambda as any).details;
+
+          // Check function policy
+          if (lambdaDetails && lambdaDetails.policy) {
+            const policy = typeof lambdaDetails.policy === 'string'
+              ? JSON.parse(lambdaDetails.policy)
+              : lambdaDetails.policy;
+
+            // Check for public invoke permissions
+            const hasPublicInvoke = policy.Statement?.some((s: any) =>
+              s.Effect === 'Allow' &&
+              (s.Principal === '*' || s.Principal?.Service === '*') &&
+              (s.Action === 'lambda:InvokeFunction' || s.Action?.includes('lambda:InvokeFunction'))
+            );
+
+            if (hasPublicInvoke) {
+              job.findings.push({
+                id: `finding-${Date.now()}-${lambda.id}-public-invoke`,
+                checkType: 'LAMBDA_PUBLIC_ACCESS' as any,
+                severity: FindingSeverity.CRITICAL,
+                status: FindingStatus.ACTIVE,
+                resourceId: lambda.id,
+                resourceType: 'Lambda',
+                resourceName: lambda.name,
+                region,
+                profile: request.profile,
+                title: 'Lambda Function with Public Invoke Permission',
+                description: `Lambda function "${lambda.name}" allows public invocation through its resource policy.`,
+                recommendation: 'Remove public invoke permissions. Use API Gateway with authentication or restrict to specific principals.',
+                detectedAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+              });
+            }
+          }
+
+          // Check for public function URLs
+          if (lambdaDetails && lambdaDetails.functionUrl) {
+            job.findings.push({
+              id: `finding-${Date.now()}-${lambda.id}-public-url`,
+              checkType: 'LAMBDA_PUBLIC_ACCESS' as any,
+              severity: FindingSeverity.HIGH,
+              status: FindingStatus.ACTIVE,
+              resourceId: lambda.id,
+              resourceType: 'Lambda',
+              resourceName: lambda.name,
+              region,
+              profile: request.profile,
+              title: 'Lambda Function with Public URL',
+              description: `Lambda function "${lambda.name}" has a publicly accessible function URL.`,
+              recommendation: 'Review function URL authentication settings and ensure AWS_IAM auth is enabled if public access is not required.',
+              detectedAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            });
+          }
+
+          processedResources++;
+          await new Promise(resolve => setTimeout(resolve, 10));
+        } catch (error: any) {
+          console.error(`[SecurityAPI] Error checking Lambda function ${lambda.id}:`, error);
+        }
+      }
+
+      // Check ECR repository policies
+      for (const repo of ecrRepos) {
+        try {
+          const repoDetails = (repo as any).details;
+
+          if (repoDetails && repoDetails.policy) {
+            const policy = typeof repoDetails.policy === 'string'
+              ? JSON.parse(repoDetails.policy)
+              : repoDetails.policy;
+
+            // Check for public access
+            const hasPublicAccess = policy.Statement?.some((s: any) =>
+              s.Effect === 'Allow' && (s.Principal === '*' || s.Principal?.AWS === '*')
+            );
+
+            if (hasPublicAccess) {
+              job.findings.push({
+                id: `finding-${Date.now()}-${repo.id}-public-policy`,
+                checkType: 'IAM_OVERPRIVILEGED_POLICY' as any,
+                severity: FindingSeverity.HIGH,
+                status: FindingStatus.ACTIVE,
+                resourceId: repo.id,
+                resourceType: 'ECR',
+                resourceName: repo.name,
+                region,
+                profile: request.profile,
+                title: 'ECR Repository with Public Access',
+                description: `ECR repository "${repo.name}" has a policy that allows public access to container images.`,
+                recommendation: 'Restrict repository access to specific AWS accounts or IAM principals.',
+                detectedAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+              });
+            }
+          }
+
+          processedResources++;
+          await new Promise(resolve => setTimeout(resolve, 10));
+        } catch (error: any) {
+          console.error(`[SecurityAPI] Error checking ECR repository ${repo.id}:`, error);
+        }
+      }
+
+      const regionProgress = Math.floor((request.regions.indexOf(region) / request.regions.length) * 34);
+      job.progress.current = 66 + regionProgress;
+      job.progress.message = `Phase 3/3: Checked ${processedResources}/${totalResources} resources in ${region}... (${job.findings.length} findings)`;
+    } catch (error: any) {
+      console.error(`[SecurityAPI] Phase 3 error in ${region}:`, error);
+      job.errors = job.errors || [];
+      job.errors.push(`Phase 3 ${region}: ${error.message}`);
+    }
+  }
+
+  // Update summary
+  updateJobSummary(job);
+
+  console.log(`[SecurityAPI] Phase 3 complete - ${job.findings.length} total findings`);
+}
+
+/**
+ * Update job summary counts
+ */
+function updateJobSummary(job: AuditJob): void {
+  job.summary = {
+    total: job.findings.length,
+    critical: job.findings.filter(f => f.severity === 'CRITICAL').length,
+    high: job.findings.filter(f => f.severity === 'HIGH').length,
+    medium: job.findings.filter(f => f.severity === 'MEDIUM').length,
+    low: job.findings.filter(f => f.severity === 'LOW').length,
+  };
+}
+
+/**
+ * Send Server-Sent Event
+ */
+function sendSSE(res: any, event: string, data: any): void {
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+export default router;
