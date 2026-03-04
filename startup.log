@@ -1,0 +1,32 @@
+============================================================
+🚀 AWS Cloud Governance Dashboard
+============================================================
+
+Starting backend and frontend servers...
+
+
+✅ Dependencies installed
+
+🧹 Checking for existing processes on ports 3000 and 3001...
+✅ Node.js version: v24.13.0
+✅ npm version: 11.6.2
+🔧 Starting backend server on http://localhost:3001
+🎨 Starting frontend server on http://localhost:3000
+
+============================================================
+✅ Servers Started!
+============================================================
+
+📍 Frontend: http://localhost:3000
+📍 Backend:  http://localhost:3001
+
+📋 Logs:
+   Backend:  tail -f backend.log
+   Frontend: tail -f frontend.log
+
+🛑 To stop servers:
+   kill 44769 44835
+   or press Ctrl+C and run: pkill -f 'npm run dev'
+
+============================================================
+Press Ctrl+C to stop servers...
