@@ -6,3 +6,4 @@ backend.log
 *.log
 ~/.aws/
 .aws/
+backend/dist/
