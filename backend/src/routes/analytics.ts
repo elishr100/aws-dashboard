@@ -186,16 +186,21 @@ router.get('/summary', async (req: Request, res: Response) => {
         trend: metrics.costs.trend,
         topSpenders: Object.entries(metrics.costs.byAccount)
           .sort(([, a], [, b]) => b - a)
-          .slice(0, 5)
           .map(([accountId, cost]) => {
             // Resolve account ID to profile name
             const accountService = new AccountDiscoveryService();
             const displayName = accountService.resolveAccountIdToProfile(accountId);
 
+            // Check if this account has cost access
+            // Cost of 0 might mean no access or genuinely no costs
+            // We'll show all accounts but note when access may be missing
+            const hasAccess = cost > 0;
+
             return {
               accountId,
               accountName: displayName,
               cost,
+              note: !hasAccess ? '(no access or $0 spend)' : undefined,
             };
           }),
         byService: metrics.costs.byService,

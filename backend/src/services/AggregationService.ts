@@ -126,50 +126,117 @@ export class AggregationService {
       });
     });
 
-    // Aggregate costs - load from persistent cache if available
+    // Aggregate costs - actively fetch for ALL profiles
     const costsByAccount: Record<string, number> = {};
     const costsByService: Record<string, number> = {};
     const costsByRegion: Record<string, number> = {};
+    const accountAccessStatus: Record<string, string> = {};
     let totalPreviousMonthCost = 0;
     let trendFromCache = 'STABLE';
     let accountsWithCostData = 0;
 
-    // Import persistent cache to get real cost data
+    // Import services needed for cost fetching
     const { persistentCache } = await import('./PersistentCacheService.js');
+    const { CostAnalysisService } = await import('./CostAnalysisService.js');
+    const { ClaudeMCPService } = await import('./ClaudeMCPService.js');
 
-    for (const account of accounts) {
-      try {
-        // Try to load cached cost data for this profile
-        const costData = persistentCache.get<any>(`costs:${account.profile}`);
-        const accountCost = costData?.totalCost || 0;
-        const previousMonth = costData?.previousMonthCost || 0;
+    console.log(`[AggregationService] Fetching costs for ${accounts.length} profiles...`);
 
-        costsByAccount[account.accountId] = accountCost;
-        costsByRegion[account.region] = (costsByRegion[account.region] || 0) + accountCost;
-        totalPreviousMonthCost += previousMonth;
+    // Fetch costs for each profile (in parallel for speed)
+    await Promise.allSettled(
+      accounts.map(async (account) => {
+        try {
+          // Try to load cached cost data first
+          let costData = persistentCache.get<any>(`costs:${account.profile}`);
 
-        // Track accounts with cost data for trend calculation
-        if (accountCost > 0 && previousMonth > 0) {
-          accountsWithCostData++;
+          // If no cached data or data is stale (older than 1 hour), fetch fresh data
+          const cacheAge = costData?.fetchedAt ? Date.now() - new Date(costData.fetchedAt).getTime() : Infinity;
+          const CACHE_MAX_AGE = 60 * 60 * 1000; // 1 hour
+
+          if (!costData || cacheAge > CACHE_MAX_AGE) {
+            console.log(`[AggregationService] Fetching fresh cost data for ${account.profile}...`);
+
+            try {
+              // Create a ClaudeMCPService instance for this profile
+              const claudeService = new ClaudeMCPService(account.profile, account.region);
+              const costService = new CostAnalysisService(claudeService);
+
+              // Calculate current month dates
+              const now = new Date();
+              const startDate = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
+              const endDate = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+
+              // Fetch cost summary
+              const costSummary = await costService.getCostSummary(account.profile, startDate, endDate);
+
+              if (costSummary.error) {
+                // No cost access for this profile
+                console.warn(`[AggregationService] No cost access for ${account.profile}: ${costSummary.error}`);
+                accountAccessStatus[account.accountId] = 'no_access';
+                costsByAccount[account.accountId] = 0;
+              } else {
+                // Cache the cost data
+                costData = {
+                  totalCost: costSummary.currentMonth || 0,
+                  previousMonthCost: costSummary.previousMonth || 0,
+                  trend: costSummary.trend || 'STABLE',
+                  fetchedAt: new Date().toISOString(),
+                };
+
+                // Persist to cache
+                await persistentCache.set(`costs:${account.profile}`, costData);
+
+                accountAccessStatus[account.accountId] = 'success';
+                console.log(`[AggregationService] Fetched cost for ${account.profile}: $${costData.totalCost.toFixed(2)}`);
+              }
+            } catch (fetchError: any) {
+              console.error(`[AggregationService] Failed to fetch costs for ${account.profile}:`, fetchError.message);
+              accountAccessStatus[account.accountId] = 'error';
+              costsByAccount[account.accountId] = 0;
+              return;
+            }
+          }
+
+          // Use the cost data (either from cache or freshly fetched)
+          if (costData) {
+            const accountCost = costData.totalCost || 0;
+            const previousMonth = costData.previousMonthCost || 0;
+
+            costsByAccount[account.accountId] = accountCost;
+            costsByRegion[account.region] = (costsByRegion[account.region] || 0) + accountCost;
+            totalPreviousMonthCost += previousMonth;
+
+            // Track accounts with cost data for trend calculation
+            if (accountCost > 0 && previousMonth > 0) {
+              accountsWithCostData++;
+            }
+
+            // Use trend from first account with cost data (or aggregate later)
+            if (costData?.trend && accountsWithCostData === 1) {
+              trendFromCache = costData.trend;
+            }
+
+            // Aggregate by service from cost data
+            if (costData?.costByService) {
+              Object.entries(costData.costByService).forEach(([service, cost]) => {
+                costsByService[service] = (costsByService[service] || 0) + (cost as number);
+              });
+            }
+
+            if (accountAccessStatus[account.accountId] !== 'success' && !accountAccessStatus[account.accountId]) {
+              accountAccessStatus[account.accountId] = 'cached';
+            }
+          }
+        } catch (error: any) {
+          console.warn(`[AggregationService] Failed to process costs for ${account.profile}:`, error.message);
+          // Set to 0 if cost data unavailable
+          costsByAccount[account.accountId] = 0;
+          accountAccessStatus[account.accountId] = 'error';
         }
+      })
+    );
 
-        // Use trend from first account with cost data (or aggregate later)
-        if (costData?.trend && accountsWithCostData === 1) {
-          trendFromCache = costData.trend;
-        }
-
-        // Aggregate by service from cost data
-        if (costData?.costByService) {
-          Object.entries(costData.costByService).forEach(([service, cost]) => {
-            costsByService[service] = (costsByService[service] || 0) + (cost as number);
-          });
-        }
-      } catch (error) {
-        console.warn(`[AggregationService] Failed to fetch costs for ${account.profile}:`, error);
-        // Set to 0 if cost data unavailable
-        costsByAccount[account.accountId] = 0;
-      }
-    }
+    console.log(`[AggregationService] Cost fetching complete. Accounts with data: ${accountsWithCostData}/${accounts.length}`);
 
     // Aggregate security - load from persistent cache
     const securityByAccount: Record<string, any> = {};
