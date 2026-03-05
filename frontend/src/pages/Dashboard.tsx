@@ -44,21 +44,38 @@ export function Dashboard() {
     refetchInterval: 30000, // Refresh every 30 seconds
   });
 
-  const { data: costSummary } = useQuery({
-    queryKey: ['cost-dashboard', selectedAccount?.profile],
+  const { data: cachedCosts, isLoading: costsLoading } = useQuery({
+    queryKey: ['cached-costs', selectedAccount?.profile],
     queryFn: async () => {
       if (!selectedAccount?.profile) return null;
       try {
-        return await costApi.getDashboardSummary(selectedAccount.profile);
+        return await costApi.getCachedCosts(selectedAccount.profile);
       } catch (err) {
         // Cost data is optional
-        console.warn('Failed to fetch cost summary:', err);
+        console.warn('Failed to fetch cached costs:', err);
         return null;
       }
     },
     enabled: !!selectedAccount?.profile,
-    refetchInterval: 300000, // 5 minutes
+    refetchInterval: 60000, // 1 minute - same as Analytics
   });
+
+  // Calculate projected month-end cost from cached data
+  const costSummary = cachedCosts && cachedCosts.totalCost !== undefined ? {
+    totalCurrentMonth: cachedCosts.totalCost,
+    projectedMonthEnd: (() => {
+      const now = new Date();
+      const daysElapsed = now.getDate();
+      const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
+      return (cachedCosts.totalCost / daysElapsed) * daysInMonth;
+    })(),
+    averageLast3Months: cachedCosts.previousMonthCost,
+    topExpensiveResources: [],
+    currency: 'USD',
+  } : null;
+
+  // Determine if we should show loading state for costs
+  const showCostLoading = costsLoading && !cachedCosts;
 
   if (isLoading) {
     return (
@@ -143,12 +160,35 @@ export function Dashboard() {
             <DollarSign className="h-4 w-4 text-muted-foreground" />
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">
-              ${costSummary?.totalCurrentMonth.toFixed(2) || '0.00'}
-            </div>
-            <p className="text-xs text-muted-foreground">
-              {costSummary?.currency || 'USD'}
-            </p>
+            {showCostLoading ? (
+              <div className="flex items-center space-x-2">
+                <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+                <div className="text-sm text-muted-foreground">Loading...</div>
+              </div>
+            ) : costSummary ? (
+              <>
+                <div className="text-2xl font-bold">
+                  ${costSummary.totalCurrentMonth.toFixed(2)}
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  {costSummary.currency}
+                </p>
+              </>
+            ) : cachedCosts?.note ? (
+              <>
+                <div className="text-2xl font-bold">$0.00</div>
+                <p className="text-xs text-muted-foreground">
+                  {cachedCosts.note}
+                </p>
+              </>
+            ) : (
+              <>
+                <div className="text-2xl font-bold">-</div>
+                <p className="text-xs text-muted-foreground">
+                  No cost data
+                </p>
+              </>
+            )}
           </CardContent>
         </Card>
 
@@ -158,12 +198,35 @@ export function Dashboard() {
             <TrendingUp className="h-4 w-4 text-muted-foreground" />
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">
-              ${costSummary?.projectedMonthEnd.toFixed(2) || '0.00'}
-            </div>
-            <p className="text-xs text-muted-foreground">
-              Forecast based on current usage
-            </p>
+            {showCostLoading ? (
+              <div className="flex items-center space-x-2">
+                <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+                <div className="text-sm text-muted-foreground">Loading...</div>
+              </div>
+            ) : costSummary ? (
+              <>
+                <div className="text-2xl font-bold">
+                  ${costSummary.projectedMonthEnd.toFixed(2)}
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  Forecast based on current usage
+                </p>
+              </>
+            ) : cachedCosts?.note ? (
+              <>
+                <div className="text-2xl font-bold">$0.00</div>
+                <p className="text-xs text-muted-foreground">
+                  {cachedCosts.note}
+                </p>
+              </>
+            ) : (
+              <>
+                <div className="text-2xl font-bold">-</div>
+                <p className="text-xs text-muted-foreground">
+                  No cost data
+                </p>
+              </>
+            )}
           </CardContent>
         </Card>
       </div>
@@ -305,19 +368,27 @@ export function Dashboard() {
             </CardDescription>
           </CardHeader>
           <CardContent>
-            <div className="space-y-2">
-              {Object.entries(resourceTypes).map(([type, count]) => (
-                <div key={type} className="flex items-center justify-between">
-                  <span className="text-sm font-medium">{type}</span>
-                  <span className="text-sm text-muted-foreground">{count}</span>
-                </div>
-              ))}
-              {Object.keys(resourceTypes).length === 0 && (
-                <p className="text-sm text-muted-foreground">
-                  No resources found. Start a scan to discover resources.
-                </p>
-              )}
-            </div>
+            {Object.keys(resourceTypes).length > 0 ? (
+              <ResponsiveContainer width="100%" height={Math.max(200, Object.keys(resourceTypes).length * 40)}>
+                <BarChart
+                  data={Object.entries(resourceTypes)
+                    .sort(([, a], [, b]) => (b as number) - (a as number))
+                    .map(([name, value]) => ({ name, value }))}
+                  layout="horizontal"
+                  margin={{ top: 5, right: 30, left: 20, bottom: 5 }}
+                >
+                  <CartesianGrid strokeDasharray="3 3" />
+                  <XAxis type="number" />
+                  <YAxis type="category" dataKey="name" width={100} />
+                  <Tooltip />
+                  <Bar dataKey="value" fill="#0088FE" label={{ position: 'right' }} />
+                </BarChart>
+              </ResponsiveContainer>
+            ) : (
+              <p className="text-sm text-muted-foreground">
+                No resources found. Start a scan to discover resources.
+              </p>
+            )}
           </CardContent>
         </Card>
 
@@ -329,19 +400,27 @@ export function Dashboard() {
             </CardDescription>
           </CardHeader>
           <CardContent>
-            <div className="space-y-2">
-              {Object.entries(stats?.byRegion || {}).map(([region, count]) => (
-                <div key={region} className="flex items-center justify-between">
-                  <span className="text-sm font-medium">{region}</span>
-                  <span className="text-sm text-muted-foreground">{count}</span>
-                </div>
-              ))}
-              {Object.keys(stats?.byRegion || {}).length === 0 && (
-                <p className="text-sm text-muted-foreground">
-                  No resources found. Start a scan to discover resources.
-                </p>
-              )}
-            </div>
+            {Object.keys(stats?.byRegion || {}).length > 0 ? (
+              <ResponsiveContainer width="100%" height={Math.max(200, Object.keys(stats?.byRegion || {}).length * 40)}>
+                <BarChart
+                  data={Object.entries(stats?.byRegion || {})
+                    .sort(([, a], [, b]) => (b as number) - (a as number))
+                    .map(([name, value]) => ({ name, value }))}
+                  layout="horizontal"
+                  margin={{ top: 5, right: 30, left: 20, bottom: 5 }}
+                >
+                  <CartesianGrid strokeDasharray="3 3" />
+                  <XAxis type="number" />
+                  <YAxis type="category" dataKey="name" width={100} />
+                  <Tooltip />
+                  <Bar dataKey="value" fill="#00C49F" label={{ position: 'right' }} />
+                </BarChart>
+              </ResponsiveContainer>
+            ) : (
+              <p className="text-sm text-muted-foreground">
+                No resources found. Start a scan to discover resources.
+              </p>
+            )}
           </CardContent>
         </Card>
       </div>
