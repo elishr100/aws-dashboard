@@ -91,20 +91,41 @@ export class CostAnalysisService {
 
       const prompt = `Using AWS Cost Explorer via MCP tools, get cost summary for profile ${profile}.
 
-IMPORTANT: Use these exact date ranges:
-- Current month: ${currentMonthStartStr} to ${today}
-- Previous month: ${previousMonthStartStr} to ${previousMonthEndStr}
+CRITICAL INSTRUCTIONS - DO NOT DEVIATE:
+1. Cost Explorer is GLOBAL - it returns costs for ALL regions combined
+2. DO NOT filter by region
+3. DO NOT group by region
+4. DO NOT query multiple regions separately and sum them
+5. The --region us-east-1 flag is ONLY the API endpoint, NOT a cost filter
 
-Get the following:
-1. Current month cost (month to date from ${currentMonthStartStr} to ${today})
-2. Previous month total cost (from ${previousMonthStartStr} to ${previousMonthEndStr})
-3. Forecasted month end cost
+Execute these EXACT AWS CLI commands:
+
+**Current month cost (${currentMonthStartStr} to ${today}):**
+aws ce get-cost-and-usage \\
+  --time-period Start=${currentMonthStartStr},End=${today} \\
+  --granularity MONTHLY \\
+  --metrics BlendedCost \\
+  --profile ${profile} \\
+  --region us-east-1 \\
+  --output json
+
+**Previous month cost (${previousMonthStartStr} to ${previousMonthEndStr}):**
+aws ce get-cost-and-usage \\
+  --time-period Start=${previousMonthStartStr},End=${previousMonthEndStr} \\
+  --granularity MONTHLY \\
+  --metrics BlendedCost \\
+  --profile ${profile} \\
+  --region us-east-1 \\
+  --output json
+
+Extract the cost from ResultsByTime[0].Total.BlendedCost.Amount from EACH command.
+DO NOT sum across regions - the result is already the total for all regions.
 
 Return JSON:
 {
   "currentMonth": 1234.56,
   "previousMonth": 1100.00,
-  "monthToDate": 800.50,
+  "monthToDate": 1234.56,
   "forecastedMonth": 1300.00,
   "currency": "USD"
 }
